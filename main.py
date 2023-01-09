@@ -1,26 +1,47 @@
 # =============================================================================
 # IMPORTS
 # =============================================================================
-import os, boto3
-from dydx3 import Client
+import os, boto3, time
 from pprint import pprint
-import dydx3.constants as dydx3_constants
 import traceback
 import datetime as dt
 import pandas as pd, numpy as np
 from dotenv import load_dotenv
 import io
+import requests
+import concurrent.futures
 
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-client = Client(host="https://api.dydx.exchange")
-MARKETS = ["BTC-USD"]
-NOW = dt.datetime.now(dt.timezone.utc)
-NOW_STR = str(NOW).split("+")[0]
-TODAY_STR = str(NOW.replace(hour=0, minute=0, second=0, microsecond=0)).split(" ")[0]
-CUR_MINUTE = NOW.replace(second=0, microsecond=0)
-PREV_MINUTE = CUR_MINUTE - dt.timedelta(minutes=1)
+DYDX_URL = "https://api.dydx.exchange/v3"
+MARKETS = [
+    "BTCCC-USD",
+    "ETH-USD",
+    "SOL-USD",
+    "ETC-USD",
+    "NEAR-USD",
+    "DOGE-USD",
+    "MATIC-USD",
+    "CRV-USD",
+    "ADA-USD",
+    "LINK-USD",
+    "AVAX-USD",
+    "LTC-USD",
+    "SUSHI-USD",
+    "COMP-USD",
+    "FIL-USD",
+    "DOT-USD",
+    "XTZ-USD",
+    "ATOM-USD",
+    "1INCH-USD",
+    "TRX-USD",
+    "SNX-USD",
+    "ZRX-USD",
+    "ENJ-USD",
+    "SNX-USD",
+    "AAVE-USD",
+]
 CSV_HEADER = "timestamp,bid_price,ask_price,bid_size,ask_size"
 CSV_HEADER = ["timestamp", "bid_price", "ask_price", "bid_size", "ask_size"]
 
@@ -43,35 +64,68 @@ BUCKET_NAME = "dydx-orderbook"
 # EXECUTION
 # =============================================================================
 def main():
-    for market in MARKETS:
-        bid_ask = get_bid_ask_from_dydx_for_market(market)
-        push_bid_ask_to_s3(market, bid_ask)
+    market_params = get_detailed_market_params()
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        result = executor.map(get_bid_ask_from_dydx_for_market, MARKETS)
+
+    now_s, today = create_relevant_date_strings()
+    for bid_ask in result:
+        bid_ask = check_if_bid_ask_proper(market_params, bid_ask)
+        push_bid_ask_to_s3(bid_ask, now_s, today)
+
+
+# =============================================================================
+# GET DETAILS LIKE TICK_SIZE, STEP_SIZE, ETC.
+# =============================================================================
+def get_detailed_market_params():
+    res = requests.get(f"{DYDX_URL}/markets")
+    res = res.json()["markets"]
+    market_params = {}
+
+    for market, data in res.items():
+        if market not in MARKETS:
+            continue
+        tick_size = float(data["tickSize"])
+        order_size = float(data["stepSize"])
+        min_order = float(data["minOrderSize"])
+
+        market_params[market] = {
+            "price_rounder": tick_size,
+            "order_size": order_size,
+            "min_order": min_order,
+        }
+    return market_params
 
 
 # =============================================================================
 # FETCH FROM EXCHANGE FOR market
 # =============================================================================
 def get_bid_ask_from_dydx_for_market(market):
-    try:
-        res = client.public.get_orderbook(market=market)
-        orderbook = res.data
-        return extract_top_of_orderbook(orderbook)
-    except Exception:
-        traceback.print_exc()
-        return create_nan_bid_ask_dict()
+    counter = 0
+    while counter < 10:
+        try:
+            res = requests.get(f"{DYDX_URL}/orderbook/{market}")
+            orderbook = res.json()
+            return extract_top_of_orderbook(market, orderbook)
+        except Exception:
+            print(f"Failed fetching data for market: {market}")
+            traceback.print_exc()
+            time.sleep(0.5)
+            counter += 1
+    return create_nan_bid_ask_dict(market)
 
 
 # =============================================================================
 # EXTRACT BEST BID AND ASKS
 # =============================================================================
-def extract_top_of_orderbook(orderbook):
+def extract_top_of_orderbook(market, orderbook):
     asks = process_orderbook_to_df(orderbook, "asks")
     bids = process_orderbook_to_df(orderbook, "bids")
 
     best_ask = asks.iloc[asks["price"].idxmin()]
     best_bid = bids.iloc[bids["price"].idxmax()]
     return {
-        "timestamp": NOW_STR,
+        "market": market,
         "ask_price": best_ask["price"],
         "ask_size": best_ask["size"],
         "bid_price": best_bid["price"],
@@ -80,11 +134,27 @@ def extract_top_of_orderbook(orderbook):
 
 
 # =============================================================================
+# ENSURE THAT BID - ASK DIFF ISN'T TOO BIG
+# =============================================================================
+def check_if_bid_ask_proper(market_params, bid_ask):
+    market = bid_ask["market"]
+    params = market_params[market]
+    diff = determine_tick_diff(params, bid_ask)
+    if diff < 10:
+        return bid_ask
+    else:
+        return create_nan_bid_ask_dict(market)
+
+
+# =============================================================================
 # PUSH DATA TO S3, MAKE NEW FILE IF NEW DAY
 # =============================================================================
-def push_bid_ask_to_s3(market, bid_ask):
-    filepath = f"{market}/{TODAY_STR}/{market}-{TODAY_STR}.csv"
-    # row = convert_dict_to_csv_row(bid_ask)
+def push_bid_ask_to_s3(bid_ask, now_s, today):
+    print("Not saving, since this is on my local machine")
+    raise Exception("Not saving, since this is on my local machine")
+    market = bid_ask.pop("market")
+    bid_ask["timestamp"] = now_s
+    filepath = f"{market}/{today}/{market}-{today}.csv"
     bid_ask = convert_bid_ask_to_df(bid_ask)
 
     if check_if_file_exists_in_s3(filepath):
@@ -110,13 +180,14 @@ def append_bid_ask_to_existing_csv(bid_ask, filepath):
 # =============================================================================
 def save_df_to_csv(df, filepath):
     df = df.set_index("timestamp")
-    print(df)
     csv_buffer = io.StringIO()
     df.to_csv(csv_buffer)
-    res = S3.put_object(Bucket=BUCKET_NAME, Key=filepath, Body=csv_buffer.getvalue())
-    print(
-        f"{filepath} saved with status code: {res['ResponseMetadata']['HTTPStatusCode']}"
-    )
+    print(df)
+    print("Not saving for testing")
+    # res = S3.put_object(Bucket=BUCKET_NAME, Key=filepath, Body=csv_buffer.getvalue())
+    # print(
+    #     f"{filepath} saved with status code: {res['ResponseMetadata']['HTTPStatusCode']}"
+    # )
 
 
 # =============================================================================
@@ -137,10 +208,20 @@ def process_orderbook_to_df(orderbook, _type):
 
 
 # =============================================================================
+# Determine tick difference between bid, ask, to make sure orderbook is proper
+# =============================================================================
+def determine_tick_diff(params, bid_ask):
+    ask, bid = bid_ask["ask_price"], bid_ask["bid_price"]
+    ticks = round((ask - bid) / params["price_rounder"], 3)
+    return abs(ticks)
+
+
+# =============================================================================
 # If exchange doesn't return proper data, create nan dictionary
 # =============================================================================
-def create_nan_bid_ask_dict() -> dict:
+def create_nan_bid_ask_dict(market) -> dict:
     return {
+        "market": market,
         "ask_price": np.nan,
         "ask_size": np.nan,
         "bid_price": np.nan,
@@ -175,6 +256,16 @@ def convert_bid_ask_to_df(bid_ask):
     df = pd.DataFrame([bid_ask])
     df = df[CSV_HEADER]
     return df
+
+
+# =============================================================================
+# CREATE THE RELEVANT DATE STRINGS
+# =============================================================================
+def create_relevant_date_strings():
+    now = dt.datetime.now(dt.timezone.utc)
+    now_s = str(now).split("+")[0]
+    today = str(now.replace(hour=0, minute=0, second=0, microsecond=0)).split(" ")[0]
+    return now_s, today
 
 
 if __name__ == "__main__":
