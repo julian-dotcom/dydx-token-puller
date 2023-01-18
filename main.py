@@ -16,34 +16,54 @@ import concurrent.futures
 # =============================================================================
 DYDX_URL = "https://api.dydx.exchange/v3"
 MARKETS = [
-    "BTCCC-USD",
-    "ETH-USD",
-    "SOL-USD",
-    "ETC-USD",
-    "NEAR-USD",
-    "DOGE-USD",
-    "MATIC-USD",
-    "CRV-USD",
-    "ADA-USD",
-    "LINK-USD",
-    "AVAX-USD",
-    "LTC-USD",
-    "SUSHI-USD",
-    "COMP-USD",
-    "FIL-USD",
-    "DOT-USD",
-    "XTZ-USD",
-    "ATOM-USD",
     "1INCH-USD",
-    "TRX-USD",
-    "SNX-USD",
-    "ZRX-USD",
-    "ENJ-USD",
-    "SNX-USD",
     "AAVE-USD",
+    "ADA-USD",
+    "ALGO-USD",
+    "ATOM-USD",
+    "AVAX-USD",
+    "BTC-USD",
+    "BCH-USD",
+    "CELO-USD",
+    "ETC-USD",
+    "COMP-USD",
+    "ICP-USD",
+    "CRV-USD",
+    "DOGE-USD",
+    "DOT-USD",
+    "ENJ-USD",
+    "EOS-USD",
+    "ETH-USD",
+    "FIL-USD",
+    "LINK-USD",
+    "LTC-USD",
+    "MATIC-USD",
+    "MKR-USD",
+    "NEAR-USD",
+    "RUNE-USD",
+    "SNX-USD",
+    "SOL-USD",
+    "SUSHI-USD",
+    "TRX-USD",
+    "UMA-USD",
+    "UNI-USD",
+    "XLM-USD",
+    "XMR-USD",
+    "XTZ-USD",
+    "YFI-USD",
+    "ZEC-USD",
+    "ZRX-USD",
 ]
-CSV_HEADER = "timestamp,bid_price,ask_price,bid_size,ask_size"
-CSV_HEADER = ["timestamp", "bid_price", "ask_price", "bid_size", "ask_size"]
+
+
+CSV_HEADER = [
+    "timestamp",
+    "bid_price",
+    "ask_price",
+    "mid",
+    "bid_size",
+    "ask_size",
+]
 
 # =============================================================================
 # AWS CONFIG
@@ -71,6 +91,7 @@ def main():
     now_s, today = create_relevant_date_strings()
     for bid_ask in result:
         bid_ask = check_if_bid_ask_proper(market_params, bid_ask)
+        bid_ask = add_mid_to_bid_ask(bid_ask)
         push_bid_ask_to_s3(bid_ask, now_s, today)
 
 
@@ -147,14 +168,21 @@ def check_if_bid_ask_proper(market_params, bid_ask):
 
 
 # =============================================================================
+# CALC MID BETWEEN BID AND ASK
+# =============================================================================
+def add_mid_to_bid_ask(bid_ask):
+    mid = (bid_ask["bid_price"] + bid_ask["ask_price"]) / 2
+    bid_ask["mid"] = round(mid, 6)
+    return bid_ask
+
+
+# =============================================================================
 # PUSH DATA TO S3, MAKE NEW FILE IF NEW DAY
 # =============================================================================
 def push_bid_ask_to_s3(bid_ask, now_s, today):
-    print("Not saving, since this is on my local machine")
-    raise Exception("Not saving, since this is on my local machine")
     market = bid_ask.pop("market")
     bid_ask["timestamp"] = now_s
-    filepath = f"{market}/{today}/{market}-{today}.csv"
+    filepath = f"{market}/{market}_{today}.csv"
     bid_ask = convert_bid_ask_to_df(bid_ask)
 
     if check_if_file_exists_in_s3(filepath):
@@ -182,8 +210,8 @@ def save_df_to_csv(df, filepath):
     df = df.set_index("timestamp")
     csv_buffer = io.StringIO()
     df.to_csv(csv_buffer)
-    print(df)
     print("Not saving for testing")
+    print(df)
     # res = S3.put_object(Bucket=BUCKET_NAME, Key=filepath, Body=csv_buffer.getvalue())
     # print(
     #     f"{filepath} saved with status code: {res['ResponseMetadata']['HTTPStatusCode']}"
