@@ -1,7 +1,7 @@
 # =============================================================================
 # IMPORTS
 # =============================================================================
-import os, boto3, time
+import os, boto3, time, json, sys
 from pprint import pprint
 import traceback
 import datetime as dt
@@ -78,44 +78,65 @@ S3 = boto3.client(
     region_name="eu-west-2",
 )
 
+# =============================================================================
+# CONSTANTS
+# =============================================================================
 BUCKET_NAME = "dydx-orderbook"
+res = requests.get(f"{DYDX_URL}/markets")
+res = res.json()["markets"]
+MARKET_PARAMS = {}
+
+for market, data in res.items():
+    if market not in MARKETS:
+        continue
+    tick_size = float(data["tickSize"])
+    order_size = float(data["stepSize"])
+    min_order = float(data["minOrderSize"])
+
+    MARKET_PARAMS[market] = {
+        "price_rounder": tick_size,
+        "order_size": order_size,
+        "min_order": min_order,
+    }
+
+# =============================================================================
+# DISCORD ALERT
+# =============================================================================
+DSC_URL = "https://discord.com/api/webhooks/1065988769095880754/2g1CGYTv7iNFvJvohzc4WZ5JAgbpF0zinEnAOOX8LVUmgqxolvZ5OY0c-T1xLwcjL4cM"
+DSC_HEADERS = {"Content-Type": "application/json"}
+DSC_SEPARATOR = "======================================================"
+
+
+def ping_discord(msg):
+    payload = handle_type_of_msg(msg)
+    payload = {"content": payload}
+    res = requests.post(DSC_URL, data=json.dumps(payload), headers=DSC_HEADERS)
+    return res
+
+
+def handle_type_of_msg(msg):
+    if isinstance(msg, BaseException):
+        _type, _value, _traceback = sys.exc_info()
+        formated = "".join(traceback.format_exception(_type, _value, _traceback))
+    else:
+        formated = str(msg)
+    return f"{DSC_SEPARATOR}\n{formated}{DSC_SEPARATOR}"
+
 
 # =============================================================================
 # EXECUTION
 # =============================================================================
 def main():
-    market_params = get_detailed_market_params()
     with concurrent.futures.ThreadPoolExecutor() as executor:
         result = executor.map(get_bid_ask_from_dydx_for_market, MARKETS)
 
     now_s, today = create_relevant_date_strings()
     for bid_ask in result:
-        bid_ask = check_if_bid_ask_proper(market_params, bid_ask)
+        if bid_ask is None:
+            print(f"Not saving anything for {bid_ask}")
+            continue
         bid_ask = add_mid_to_bid_ask(bid_ask)
         push_bid_ask_to_s3(bid_ask, now_s, today)
-
-
-# =============================================================================
-# GET DETAILS LIKE TICK_SIZE, STEP_SIZE, ETC.
-# =============================================================================
-def get_detailed_market_params():
-    res = requests.get(f"{DYDX_URL}/markets")
-    res = res.json()["markets"]
-    market_params = {}
-
-    for market, data in res.items():
-        if market not in MARKETS:
-            continue
-        tick_size = float(data["tickSize"])
-        order_size = float(data["stepSize"])
-        min_order = float(data["minOrderSize"])
-
-        market_params[market] = {
-            "price_rounder": tick_size,
-            "order_size": order_size,
-            "min_order": min_order,
-        }
-    return market_params
 
 
 # =============================================================================
@@ -127,13 +148,15 @@ def get_bid_ask_from_dydx_for_market(market):
         try:
             res = requests.get(f"{DYDX_URL}/orderbook/{market}")
             orderbook = res.json()
-            return extract_top_of_orderbook(market, orderbook)
-        except Exception:
+            bid_ask = extract_top_of_orderbook(market, orderbook)
+            bid_ask = check_if_bid_ask_proper(bid_ask)
+            return bid_ask
+        except Exception as e:
             print(f"Failed fetching data for market: {market}")
+            ping_discord(e)
             traceback.print_exc()
-            time.sleep(0.5)
+            time.sleep(0.3)
             counter += 1
-    return create_nan_bid_ask_dict(market)
 
 
 # =============================================================================
@@ -157,14 +180,15 @@ def extract_top_of_orderbook(market, orderbook):
 # =============================================================================
 # ENSURE THAT BID - ASK DIFF ISN'T TOO BIG
 # =============================================================================
-def check_if_bid_ask_proper(market_params, bid_ask):
+def check_if_bid_ask_proper(bid_ask):
     market = bid_ask["market"]
-    params = market_params[market]
+    params = MARKET_PARAMS[market]
     diff = determine_tick_diff(params, bid_ask)
     if diff < 10:
         return bid_ask
     else:
-        return create_nan_bid_ask_dict(market)
+        print("bid_ask", bid_ask, "diff: ", diff)
+        raise Exception("Orderbook too loose.")
 
 
 # =============================================================================
@@ -211,7 +235,6 @@ def save_df_to_csv(df, filepath):
     csv_buffer = io.StringIO()
     df.to_csv(csv_buffer)
     print("Not saving for testing")
-    print(df)
     # res = S3.put_object(Bucket=BUCKET_NAME, Key=filepath, Body=csv_buffer.getvalue())
     # print(
     #     f"{filepath} saved with status code: {res['ResponseMetadata']['HTTPStatusCode']}"
